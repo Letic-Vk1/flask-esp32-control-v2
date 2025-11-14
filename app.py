@@ -1,118 +1,85 @@
-import os
-import json
-from flask import Flask, request, jsonify
-import paho.mqtt.publish as publish
-from functools import wraps
-
-# =========================================================
-#                   CONFIGURACIÓN DE ENTORNO
-# =========================================================
-# NOTA: Estos valores se leen de las variables de entorno de Render.
-# Debes configurarlas en el panel de control de Render (Environment Variables).
-
-# Clave de seguridad (API_KEY) - Se utiliza para autenticar las peticiones entrantes desde Flutter
-API_KEY = os.environ.get("RENDER_API_KEY") 
-if not API_KEY:
-    print("FATAL: La variable de entorno RENDER_API_KEY no está configurada.")
-
-# Configuración del Broker MQTT
-MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "tu.broker.mqtt.com")
-MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", 1883))
-
-# Tópico MQTT al que el servidor publicará los comandos (debe coincidir con el ESP32)
-MQTT_TOPIC = "iot/command/led_control"
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+# Importamos la librería de Redis
+import redis
+import os, json
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# =========================================================
-#                   DECORADOR DE AUTENTICACIÓN
-# =========================================================
+# --- CONEXIÓN A REDIS ---
+# Render usará la variable de entorno REDIS_URL para la conexión.
+# Si no está definida (ej. desarrollo local), usamos una configuración local por defecto.
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+r = redis.from_url(REDIS_URL, decode_responses=True)
 
-def require_api_key(f):
-    """
-    Decorador para proteger las rutas, asegurando que solo las peticiones
-    con la API Key correcta en el header 'X-API-Key' sean procesadas.
-    """
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # 1. Comprobar si la API Key está disponible en el entorno de Render
-        if not API_KEY:
-            # En un entorno de producción, esto debería ser un error crítico
-            app.logger.error("API_KEY no configurada. Denegando acceso.")
-            return jsonify({"error": "Configuración de seguridad incompleta en el servidor."}), 500
+# Clave donde guardaremos el estado de los LEDs en Redis
+LED_KEY = "LED_STATUS"
 
-        # 2. Leer la clave enviada en el header de la petición
-        sent_key = request.headers.get('X-API-Key')
-        
-        # 3. Comparar la clave enviada con la clave del entorno
-        if sent_key and sent_key == API_KEY:
-            return f(*args, **kwargs)
-        else:
-            app.logger.warning(f"Intento de acceso denegado. Clave enviada: {sent_key}")
-            return jsonify({"error": "Acceso denegado. Clave API inválida."}), 403
+# --- Inicialización del Estado en Redis ---
+# Solo inicializa los valores si la clave LED_STATUS no existe
+if not r.exists(LED_KEY):
+    # Guardamos el JSON del estado inicial como una cadena en Redis
+    estado_inicial = {"led1": False, "led2": False}
+    r.set(LED_KEY, json.dumps(estado_inicial))
+    print("✅ Estado inicial de LEDs configurado en Redis.")
 
-    return decorated_function
 
-# =========================================================
-#                   RUTAS DEL SERVIDOR
-# =========================================================
+def leer_leds():
+    """Lee el estado de los LEDs desde Redis y lo convierte a un diccionario Python."""
+    # Obtenemos la cadena JSON de Redis
+    json_str = r.get(LED_KEY)
+    if json_str:
+        return json.loads(json_str)
+    # Fallback si por alguna razón la clave no existe
+    return {"led1": False, "led2": False}
+
+def guardar_leds(data):
+    """Convierte el diccionario a JSON y lo guarda en Redis."""
+    # Convertimos el diccionario a JSON string
+    json_str = json.dumps(data)
+    # Guardamos el string en Redis
+    r.set(LED_KEY, json_str)
+
+
+@app.route("/led/status", methods=["GET"])
+def led_status():
+    leds = leer_leds()
+    return jsonify(leds)
+
+@app.route("/led/on/<led>", methods=["GET", "POST"])
+def led_on(led):
+    leds = leer_leds()
+    key = f"led{led}"
+    if key in leds:
+        leds[key] = True
+        guardar_leds(leds)
+        print(f"✅ {key} encendido y guardado en Redis")
+        return jsonify({"message": f"{key} encendido"}), 200
+    return jsonify({"error": "LED no encontrado"}), 404
+
+@app.route("/led/off/<led>", methods=["GET", "POST"])
+def led_off(led):
+    leds = leer_leds()
+    key = f"led{led}"
+    if key in leds:
+        leds[key] = False
+        guardar_leds(leds)
+        print(f"🚫 {key} apagado y guardado en Redis")
+        return jsonify({"message": f"{key} apagado"}), 200
+    return jsonify({"error": "LED no encontrado"}), 404
 
 @app.route("/")
 def home():
-    """Ruta de prueba simple."""
-    return "Servidor Flask IoT operativo y listo para recibir comandos.", 200
-
-@app.route("/command", methods=["POST"])
-@require_api_key
-def handle_command():
+    return """
+    <h2>✅ Servidor Flask ESP32 - Control de LEDs (Usando Redis)</h2>
+    <p>Rutas disponibles:</p>
+    <ul>
+        <li>/led/status</li>
+        <li>/led/on/1 o /led/on/2</li>
+        <li>/led/off/1 o /led/off/2</li>
+    </ul>
     """
-    Recibe el comando JSON de Flutter y lo publica al Broker MQTT.
-    El ESP32, que está suscrito, recibe el mensaje en tiempo real.
-    """
-    try:
-        data = request.get_json()
-        
-        # Validación de la estructura de datos
-        led_id = data.get("ledId")
-        state = data.get("state") # "on" o "off"
-
-        if led_id not in [1, 2] or state not in ["on", "off"]:
-            return jsonify({"error": "Payload JSON inválido. Se espera {'ledId': 1 o 2, 'state': 'on' o 'off'}"}), 400
-
-        # Crear el mensaje JSON para el ESP32 (usando claves cortas para ahorrar bytes)
-        # {"id": 1, "st": "on"}
-        mqtt_payload = json.dumps({
-            "id": led_id,
-            "st": state
-        })
-        
-        # =========================================================
-        #                     PUBLICACIÓN MQTT
-        # =========================================================
-        
-        # NOTA: Usamos la API_KEY como contraseña para el Broker MQTT,
-        # lo que debe coincidir con cómo el ESP32 está configurado.
-        
-        publish.single(
-            topic=MQTT_TOPIC,
-            payload=mqtt_payload,
-            hostname=MQTT_BROKER_HOST,
-            port=MQTT_BROKER_PORT,
-            auth={'username': '', 'password': API_KEY}, # Usamos API_KEY como contraseña
-            qos=1 # Calidad de Servicio 1 (al menos una vez)
-        )
-
-        app.logger.info(f"Comando publicado al tópico {MQTT_TOPIC}: {mqtt_payload}")
-        
-        return jsonify({
-            "status": "success",
-            "message": f"Comando {state} para LED {led_id} publicado vía MQTT."
-        }), 200
-
-    except Exception as e:
-        app.logger.error(f"Error procesando el comando: {e}")
-        return jsonify({"error": f"Error interno del servidor: {e}"}), 500
 
 if __name__ == "__main__":
-    # Importante: Gunicorn es usado por Render. Este bloque es para pruebas locales.
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000), debug=True)
+    app.run(host="0.0.0.0", port=5000)
