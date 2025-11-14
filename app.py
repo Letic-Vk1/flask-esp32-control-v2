@@ -9,7 +9,6 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- CONEXIÓN A REDIS ---
 # Render usará la variable de entorno REDIS_URL para la conexión.
-# Si no está definida (ej. desarrollo local), usamos una configuración local por defecto.
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -54,6 +53,7 @@ def led_on(led):
     if key in leds:
         leds[key] = True
         guardar_leds(leds)
+        # ⚠️ NOTA: Ya NO hay llamada a notificar_esp32() aquí.
         print(f"✅ {key} encendido y guardado en Redis")
         return jsonify({"message": f"{key} encendido"}), 200
     return jsonify({"error": "LED no encontrado"}), 404
@@ -65,6 +65,7 @@ def led_off(led):
     if key in leds:
         leds[key] = False
         guardar_leds(leds)
+        # ⚠️ NOTA: Ya NO hay llamada a notificar_esp32() aquí.
         print(f"🚫 {key} apagado y guardado en Redis")
         return jsonify({"message": f"{key} apagado"}), 200
     return jsonify({"error": "LED no encontrado"}), 404
